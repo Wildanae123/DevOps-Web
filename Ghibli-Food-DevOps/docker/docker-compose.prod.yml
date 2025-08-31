@@ -1,0 +1,101 @@
+version: '3.8'
+
+services:
+  # Production overrides for main docker-compose.yml
+  postgres:
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.5'
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+
+  backend:
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
+    environment:
+      NODE_ENV: production
+      LOG_LEVEL: info
+      RATE_LIMIT_REQUESTS: 1000
+      RATE_LIMIT_WINDOW: 900000
+
+  frontend:
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.25'
+
+  ml-service:
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1'
+        reservations:
+          memory: 1G
+          cpus: '0.5'
+
+  nginx:
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ../nginx/nginx.prod.conf:/etc/nginx/nginx.conf:ro
+      - ssl_certs:/etc/nginx/ssl
+
+  # Additional production services
+  watchtower:
+    image: containrrr/watchtower
+    container_name: ghibli_watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_POLL_INTERVAL: 300
+      WATCHTOWER_INCLUDE_STOPPED: "true"
+    networks:
+      - ghibli-network
+
+  # Log aggregation
+  loki:
+    image: grafana/loki:latest
+    container_name: ghibli_loki
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    volumes:
+      - ../monitoring/loki.yml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - ghibli-network
+
+  # Log shipping
+  promtail:
+    image: grafana/promtail:latest
+    container_name: ghibli_promtail
+    restart: unless-stopped
+    volumes:
+      - ../monitoring/promtail.yml:/etc/promtail/config.yml:ro
+      - /var/log:/var/log:ro
+      - backend_logs:/var/log/app:ro
+      - nginx_logs:/var/log/nginx:ro
+    command: -config.file=/etc/promtail/config.yml
+    networks:
+      - ghibli-network
+
+volumes:
+  loki_data:

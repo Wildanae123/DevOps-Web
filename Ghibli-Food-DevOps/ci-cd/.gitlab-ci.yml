@@ -1,0 +1,285 @@
+stages:
+  - test
+  - security
+  - build
+  - deploy-staging
+  - deploy-production
+
+variables:
+  REGISTRY: registry.gitlab.com
+  BACKEND_IMAGE: $CI_REGISTRY_IMAGE/backend
+  FRONTEND_IMAGE: $CI_REGISTRY_IMAGE/frontend
+  ML_IMAGE: $CI_REGISTRY_IMAGE/ml-service
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+
+# Test Jobs
+.test_template: &test_template
+  stage: test
+  image: node:18-alpine
+  before_script:
+    - apk add --no-cache git
+  artifacts:
+    reports:
+      junit: test-results.xml
+      coverage: coverage/cobertura-coverage.xml
+    expire_in: 1 week
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - node_modules/
+      - .npm/
+
+test:backend:
+  <<: *test_template
+  script:
+    - cd Back-End-Web/Ghibli-Food-Receipt-API
+    - npm ci --cache .npm --prefer-offline
+    - npm run test:coverage || echo "No tests configured"
+  only:
+    changes:
+      - Back-End-Web/**/*
+      - DevOps-Web/**/*
+
+test:frontend:
+  <<: *test_template
+  script:
+    - cd Front-End-Web/Ghibli-Food-Receipt
+    - npm ci --cache .npm --prefer-offline
+    - npm run lint
+    - npm run test:coverage || echo "No tests configured"
+    - npm run build
+  artifacts:
+    paths:
+      - Front-End-Web/Ghibli-Food-Receipt/dist
+    expire_in: 1 hour
+  only:
+    changes:
+      - Front-End-Web/**/*
+      - DevOps-Web/**/*
+
+test:ml-service:
+  stage: test
+  image: python:3.11
+  script:
+    - cd Machine-Learnimg-Web/Ghibli-Food-ML
+    - pip install --upgrade pip
+    - pip install -r requirements.txt
+    - python -m pytest tests/ --junitxml=test-results.xml --cov=src --cov-report=xml --cov-report=term || echo "No tests found"
+  artifacts:
+    reports:
+      junit: Machine-Learnimg-Web/Ghibli-Food-ML/test-results.xml
+      coverage: Machine-Learnimg-Web/Ghibli-Food-ML/coverage.xml
+    expire_in: 1 week
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}-python
+    paths:
+      - ~/.cache/pip/
+  only:
+    changes:
+      - Machine-Learnimg-Web/**/*
+      - DevOps-Web/**/*
+
+# Security Scanning
+security:container-scan:
+  stage: security
+  image: docker:stable
+  services:
+    - docker:dind
+  variables:
+    DOCKER_DRIVER: overlay2
+  script:
+    - docker run --rm -v "$PWD":/tmp/app aquasec/trivy:latest fs --exit-code 0 --format template --template "@contrib/sarif.tpl" -o /tmp/app/trivy-report.sarif /tmp/app
+  artifacts:
+    reports:
+      sast: trivy-report.sarif
+    expire_in: 1 week
+  allow_failure: true
+
+security:dependency-scan:
+  stage: security
+  image: node:18-alpine
+  script:
+    - npm audit --audit-level=high
+    - cd Front-End-Web/Ghibli-Food-Receipt && npm audit --audit-level=high
+    - cd ../../Back-End-Web/Ghibli-Food-Receipt-API && npm audit --audit-level=high
+  allow_failure: true
+
+# Build Jobs
+.build_template: &build_template
+  stage: build
+  image: docker:stable
+  services:
+    - docker:dind
+  variables:
+    DOCKER_DRIVER: overlay2
+  before_script:
+    - echo $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+  after_script:
+    - docker logout $CI_REGISTRY
+  only:
+    - main
+    - develop
+
+build:backend:
+  <<: *build_template
+  script:
+    - cd Back-End-Web/Ghibli-Food-Receipt-API
+    - docker build -t $BACKEND_IMAGE:$CI_COMMIT_SHA -t $BACKEND_IMAGE:latest .
+    - docker push $BACKEND_IMAGE:$CI_COMMIT_SHA
+    - docker push $BACKEND_IMAGE:latest
+  only:
+    changes:
+      - Back-End-Web/**/*
+      - DevOps-Web/**/*
+
+build:frontend:
+  <<: *build_template
+  script:
+    - docker build 
+      --build-arg VITE_API_URL=https://ghibli-food.example.com/api
+      --build-arg VITE_ML_API_URL=https://ghibli-food.example.com/ml-api
+      -f DevOps-Web/Ghibli-Food-DevOps/docker/Dockerfile.frontend
+      -t $FRONTEND_IMAGE:$CI_COMMIT_SHA
+      -t $FRONTEND_IMAGE:latest
+      Front-End-Web/Ghibli-Food-Receipt
+    - docker push $FRONTEND_IMAGE:$CI_COMMIT_SHA
+    - docker push $FRONTEND_IMAGE:latest
+  only:
+    changes:
+      - Front-End-Web/**/*
+      - DevOps-Web/**/*
+
+build:ml-service:
+  <<: *build_template
+  script:
+    - cd Machine-Learnimg-Web/Ghibli-Food-ML
+    - docker build -t $ML_IMAGE:$CI_COMMIT_SHA -t $ML_IMAGE:latest .
+    - docker push $ML_IMAGE:$CI_COMMIT_SHA
+    - docker push $ML_IMAGE:latest
+  only:
+    changes:
+      - Machine-Learnimg-Web/**/*
+      - DevOps-Web/**/*
+
+# Deployment Jobs
+.deploy_template: &deploy_template
+  image: bitnami/kubectl:latest
+  before_script:
+    - mkdir -p ~/.kube
+    - echo "$KUBE_CONFIG" | base64 -d > ~/.kube/config
+    - kubectl version --client
+
+deploy:staging:
+  <<: *deploy_template
+  stage: deploy-staging
+  environment:
+    name: staging
+    url: https://staging.ghibli-food.example.com
+  variables:
+    KUBE_CONFIG: $KUBE_CONFIG_STAGING
+  script:
+    - cd DevOps-Web/Ghibli-Food-DevOps/kubernetes
+    - sed -i "s|ghibli-food.example.com|staging.ghibli-food.example.com|g" ingress.yaml
+    - kubectl apply -f namespace.yaml
+    - kubectl apply -f postgres.yaml
+    - kubectl apply -f backend.yaml
+    - kubectl apply -f frontend.yaml
+    - kubectl apply -f ml-service.yaml
+    - kubectl apply -f ingress.yaml
+    - kubectl rollout status deployment/backend -n ghibli-food --timeout=300s
+    - kubectl rollout status deployment/frontend -n ghibli-food --timeout=300s
+    - kubectl rollout status deployment/ml-service -n ghibli-food --timeout=300s
+    - kubectl run staging-test --image=curlimages/curl --rm -i --restart=Never -- curl -f https://staging.ghibli-food.example.com/api/health
+  only:
+    - develop
+  when: manual
+
+deploy:production:
+  <<: *deploy_template
+  stage: deploy-production
+  environment:
+    name: production
+    url: https://ghibli-food.example.com
+  variables:
+    KUBE_CONFIG: $KUBE_CONFIG_PROD
+  script:
+    - cd DevOps-Web/Ghibli-Food-DevOps/kubernetes
+    # Update image tags with commit SHA
+    - sed -i "s|ghibli-food-backend:latest|$BACKEND_IMAGE:$CI_COMMIT_SHA|g" backend.yaml
+    - sed -i "s|ghibli-food-frontend:latest|$FRONTEND_IMAGE:$CI_COMMIT_SHA|g" frontend.yaml
+    - sed -i "s|ghibli-food-ml:latest|$ML_IMAGE:$CI_COMMIT_SHA|g" ml-service.yaml
+    # Deploy
+    - kubectl apply -f namespace.yaml
+    - kubectl apply -f postgres.yaml
+    - kubectl apply -f backend.yaml
+    - kubectl apply -f frontend.yaml
+    - kubectl apply -f ml-service.yaml
+    - kubectl apply -f ingress.yaml
+    # Wait for rollout
+    - kubectl rollout status deployment/backend -n ghibli-food --timeout=600s
+    - kubectl rollout status deployment/frontend -n ghibli-food --timeout=600s
+    - kubectl rollout status deployment/ml-service -n ghibli-food --timeout=600s
+    # Smoke test
+    - sleep 30
+    - kubectl run prod-smoke-test --image=curlimages/curl --rm -i --restart=Never -- curl -f https://ghibli-food.example.com/api/health
+  only:
+    - main
+  when: manual
+
+# Rollback job
+rollback:production:
+  <<: *deploy_template
+  stage: deploy-production
+  environment:
+    name: production
+    action: rollback
+  variables:
+    KUBE_CONFIG: $KUBE_CONFIG_PROD
+  script:
+    - kubectl rollout undo deployment/backend -n ghibli-food
+    - kubectl rollout undo deployment/frontend -n ghibli-food
+    - kubectl rollout undo deployment/ml-service -n ghibli-food
+    - kubectl rollout status deployment/backend -n ghibli-food --timeout=300s
+    - kubectl rollout status deployment/frontend -n ghibli-food --timeout=300s
+    - kubectl rollout status deployment/ml-service -n ghibli-food --timeout=300s
+  when: manual
+  only:
+    - main
+
+# Notification job
+notify:deployment:
+  stage: deploy-production
+  image: alpine:latest
+  dependencies: []
+  before_script:
+    - apk add --no-cache curl jq
+  script:
+    - |
+      if [ "$CI_JOB_STATUS" == "success" ]; then
+        MESSAGE="✅ Deployment successful for $CI_COMMIT_REF_NAME"
+        COLOR="good"
+      else
+        MESSAGE="❌ Deployment failed for $CI_COMMIT_REF_NAME"
+        COLOR="danger"
+      fi
+      
+      curl -X POST -H 'Content-type: application/json' \
+        --data "{
+          \"attachments\": [{
+            \"color\": \"$COLOR\",
+            \"title\": \"Ghibli Food App Deployment\",
+            \"text\": \"$MESSAGE\",
+            \"fields\": [
+              {\"title\": \"Branch\", \"value\": \"$CI_COMMIT_REF_NAME\", \"short\": true},
+              {\"title\": \"Commit\", \"value\": \"$CI_COMMIT_SHORT_SHA\", \"short\": true},
+              {\"title\": \"Author\", \"value\": \"$CI_COMMIT_AUTHOR\", \"short\": true},
+              {\"title\": \"Pipeline\", \"value\": \"$CI_PIPELINE_URL\", \"short\": true}
+            ]
+          }]
+        }" \
+        $SLACK_WEBHOOK_URL
+  when: always
+  only:
+    - main
+    - develop

@@ -1,0 +1,163 @@
+groups:
+- name: ghibli-food-alerts
+  rules:
+  # Application Health Alerts
+  - alert: ApplicationDown
+    expr: up{job=~"ghibli-backend|ghibli-ml-service"} == 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Application {{ $labels.job }} is down"
+      description: "{{ $labels.job }} has been down for more than 1 minute."
+
+  - alert: HighErrorRate
+    expr: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.1
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High error rate detected"
+      description: "Error rate is {{ $value | humanizePercentage }} for {{ $labels.job }}"
+
+  # Resource Usage Alerts
+  - alert: HighCPUUsage
+    expr: 100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High CPU usage detected"
+      description: "CPU usage is above 80% for instance {{ $labels.instance }}"
+
+  - alert: HighMemoryUsage
+    expr: (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 > 85
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High memory usage detected"
+      description: "Memory usage is above 85% for instance {{ $labels.instance }}"
+
+  - alert: DiskSpaceLow
+    expr: (1 - node_filesystem_avail_bytes / node_filesystem_size_bytes) * 100 > 90
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Low disk space"
+      description: "Disk usage is above 90% for {{ $labels.mountpoint }} on {{ $labels.instance }}"
+
+  # Database Alerts
+  - alert: PostgreSQLDown
+    expr: up{job="postgres"} == 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "PostgreSQL is down"
+      description: "PostgreSQL database has been down for more than 1 minute."
+
+  - alert: PostgreSQLHighConnections
+    expr: pg_stat_database_numbackends / pg_settings_max_connections * 100 > 80
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High PostgreSQL connections"
+      description: "PostgreSQL connection usage is above 80%"
+
+  - alert: PostgreSQLSlowQueries
+    expr: pg_stat_activity_max_tx_duration > 300
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Slow PostgreSQL queries detected"
+      description: "PostgreSQL has queries running for more than 5 minutes"
+
+  # Application-specific Alerts
+  - alert: MLModelTrainingFailed
+    expr: ghibli_ml_model_training_errors_total > 0
+    for: 1m
+    labels:
+      severity: warning
+    annotations:
+      summary: "ML model training failed"
+      description: "ML model training has failed {{ $value }} times"
+
+  - alert: HighRecommendationLatency
+    expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job="ghibli-ml-service", endpoint="/api/v1/recommendations/user"}[5m])) > 2
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High recommendation latency"
+      description: "95th percentile latency is {{ $value }}s for ML recommendations"
+
+  # Container Alerts
+  - alert: ContainerKilled
+    expr: time() - container_last_seen > 60
+    for: 0m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Container killed"
+      description: "A container has disappeared"
+
+  - alert: ContainerHighCpuUsage
+    expr: (sum(rate(container_cpu_usage_seconds_total[3m])) BY (instance, name) * 100) > 80
+    for: 2m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Container High CPU usage"
+      description: "Container CPU usage is above 80%"
+
+  - alert: ContainerHighMemoryUsage
+    expr: (sum(container_memory_working_set_bytes) BY (instance, name) / sum(container_spec_memory_limit_bytes > 0) BY (instance, name) * 100) > 80
+    for: 2m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Container High Memory usage"
+      description: "Container Memory usage is above 80%"
+
+- name: kubernetes-alerts
+  rules:
+  # Kubernetes-specific Alerts
+  - alert: KubernetesPodCrashLooping
+    expr: rate(kube_pod_container_status_restarts_total[10m]) * 60 * 10 > 0
+    for: 0m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Kubernetes pod crash looping"
+      description: "Pod {{ $labels.pod }} is crash looping"
+
+  - alert: KubernetesPodNotReady
+    expr: kube_pod_status_phase{phase=~"Pending|Unknown"} > 0
+    for: 15m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Kubernetes pod not ready"
+      description: "Pod {{ $labels.pod }} has been in a non-ready state for longer than 15 minutes"
+
+  - alert: KubernetesDeploymentReplicasMismatch
+    expr: kube_deployment_spec_replicas != kube_deployment_status_available_replicas
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Kubernetes Deployment replicas mismatch"
+      description: "Deployment {{ $labels.deployment }} has {{ $labels.spec_replicas }} desired replicas but {{ $labels.available_replicas }} available"
+
+  - alert: KubernetesHpaMaxedOut
+    expr: kube_hpa_status_current_replicas == kube_hpa_spec_max_replicas
+    for: 15m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Kubernetes HPA maxed out"
+      description: "HPA {{ $labels.hpa }} has reached maximum replica count"

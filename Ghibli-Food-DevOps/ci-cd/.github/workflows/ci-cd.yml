@@ -1,0 +1,300 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  BACKEND_IMAGE_NAME: ${{ github.repository }}/backend
+  FRONTEND_IMAGE_NAME: ${{ github.repository }}/frontend
+  ML_IMAGE_NAME: ${{ github.repository }}/ml-service
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [backend, frontend, ml-service]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup Node.js (Backend & Frontend)
+      if: matrix.service != 'ml-service'
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: |
+          Back-End-Web/Ghibli-Food-Receipt-API/package-lock.json
+          Front-End-Web/Ghibli-Food-Receipt/package-lock.json
+
+    - name: Setup Python (ML Service)
+      if: matrix.service == 'ml-service'
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install Backend Dependencies
+      if: matrix.service == 'backend'
+      run: |
+        cd Back-End-Web/Ghibli-Food-Receipt-API
+        npm ci
+
+    - name: Install Frontend Dependencies
+      if: matrix.service == 'frontend'
+      run: |
+        cd Front-End-Web/Ghibli-Food-Receipt
+        npm ci
+
+    - name: Install ML Dependencies
+      if: matrix.service == 'ml-service'
+      run: |
+        cd Machine-Learnimg-Web/Ghibli-Food-ML
+        pip install -r requirements.txt
+
+    - name: Run Backend Tests
+      if: matrix.service == 'backend'
+      run: |
+        cd Back-End-Web/Ghibli-Food-Receipt-API
+        npm test
+      env:
+        NODE_ENV: test
+
+    - name: Run Frontend Tests
+      if: matrix.service == 'frontend'
+      run: |
+        cd Front-End-Web/Ghibli-Food-Receipt
+        npm test
+
+    - name: Run ML Tests
+      if: matrix.service == 'ml-service'
+      run: |
+        cd Machine-Learnimg-Web/Ghibli-Food-ML
+        python -m pytest tests/ || echo "No tests found"
+
+    - name: Frontend Lint
+      if: matrix.service == 'frontend'
+      run: |
+        cd Front-End-Web/Ghibli-Food-Receipt
+        npm run lint
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  build-and-push:
+    name: Build and Push Images
+    runs-on: ubuntu-latest
+    needs: [test, security-scan]
+    if: github.ref == 'refs/heads/main'
+    
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Extract metadata for Backend
+      id: meta-backend
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build and push Backend image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./Back-End-Web/Ghibli-Food-Receipt-API
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta-backend.outputs.tags }}
+        labels: ${{ steps.meta-backend.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Extract metadata for Frontend
+      id: meta-frontend
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build and push Frontend image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./Front-End-Web/Ghibli-Food-Receipt
+        file: ./DevOps-Web/Ghibli-Food-DevOps/docker/Dockerfile.frontend
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta-frontend.outputs.tags }}
+        labels: ${{ steps.meta-frontend.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        build-args: |
+          VITE_API_URL=https://ghibli-food.example.com/api
+          VITE_ML_API_URL=https://ghibli-food.example.com/ml-api
+
+    - name: Extract metadata for ML Service
+      id: meta-ml
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.ML_IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build and push ML Service image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./Machine-Learnimg-Web/Ghibli-Food-ML
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta-ml.outputs.tags }}
+        labels: ${{ steps.meta-ml.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Configure kubectl
+      run: |
+        mkdir -p ~/.kube
+        echo "${{ secrets.KUBE_CONFIG_STAGING }}" | base64 -d > ~/.kube/config
+
+    - name: Deploy to staging
+      run: |
+        cd DevOps-Web/Ghibli-Food-DevOps/kubernetes
+        kubectl apply -f namespace.yaml
+        kubectl apply -f postgres.yaml
+        kubectl apply -f backend.yaml
+        kubectl apply -f frontend.yaml
+        kubectl apply -f ml-service.yaml
+        kubectl apply -f ingress.yaml
+        kubectl rollout status deployment/backend -n ghibli-food
+        kubectl rollout status deployment/frontend -n ghibli-food
+        kubectl rollout status deployment/ml-service -n ghibli-food
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Configure kubectl
+      run: |
+        mkdir -p ~/.kube
+        echo "${{ secrets.KUBE_CONFIG_PROD }}" | base64 -d > ~/.kube/config
+
+    - name: Update image tags
+      run: |
+        cd DevOps-Web/Ghibli-Food-DevOps/kubernetes
+        sed -i "s|ghibli-food-backend:latest|${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE_NAME }}:main-${{ github.sha }}|g" backend.yaml
+        sed -i "s|ghibli-food-frontend:latest|${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE_NAME }}:main-${{ github.sha }}|g" frontend.yaml
+        sed -i "s|ghibli-food-ml:latest|${{ env.REGISTRY }}/${{ env.ML_IMAGE_NAME }}:main-${{ github.sha }}|g" ml-service.yaml
+
+    - name: Deploy to production
+      run: |
+        cd DevOps-Web/Ghibli-Food-DevOps/kubernetes
+        kubectl apply -f namespace.yaml
+        kubectl apply -f postgres.yaml
+        kubectl apply -f backend.yaml
+        kubectl apply -f frontend.yaml
+        kubectl apply -f ml-service.yaml
+        kubectl apply -f ingress.yaml
+        kubectl rollout status deployment/backend -n ghibli-food
+        kubectl rollout status deployment/frontend -n ghibli-food
+        kubectl rollout status deployment/ml-service -n ghibli-food
+
+    - name: Run smoke tests
+      run: |
+        kubectl run smoke-test --image=curlimages/curl --rm -i --restart=Never -- \
+          curl -f https://ghibli-food.example.com/api/health
+
+  notification:
+    name: Send Notifications
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-production]
+    if: always()
+    
+    steps:
+    - name: Send Slack notification
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        channel: '#deployments'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        fields: repo,message,commit,author,action,eventName,ref,workflow

@@ -1,0 +1,176 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ml-service-config
+  namespace: ghibli-food
+data:
+  HOST: "0.0.0.0"
+  PORT: "8001"
+  DEBUG: "false"
+  MAIN_API_URL: "http://backend-service:5000/api/v1"
+  POSTGRES_SERVER: "postgres-service"
+  POSTGRES_USER: "postgres"
+  POSTGRES_DB: "ghibli_food_db"
+  POSTGRES_PORT: "5432"
+  MODEL_PATH: "/app/models/"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ml-service-secret
+  namespace: ghibli-food
+type: Opaque
+data:
+  POSTGRES_PASSWORD: cGFzc3dvcmQxMjM= # base64 encoded "password123"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ml-models-pvc
+  namespace: ghibli-food
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: standard
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-service
+  namespace: ghibli-food
+  labels:
+    app: ml-service
+    tier: ml
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ml-service
+      tier: ml
+  template:
+    metadata:
+      labels:
+        app: ml-service
+        tier: ml
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8001"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: ml-service
+        image: ghibli-food-ml:latest
+        ports:
+        - containerPort: 8001
+          name: http
+        env:
+        - name: HOST
+          valueFrom:
+            configMapKeyRef:
+              name: ml-service-config
+              key: HOST
+        - name: PORT
+          valueFrom:
+            configMapKeyRef:
+              name: ml-service-config
+              key: PORT
+        - name: DEBUG
+          valueFrom:
+            configMapKeyRef:
+              name: ml-service-config
+              key: DEBUG
+        - name: MAIN_API_URL
+          valueFrom:
+            configMapKeyRef:
+              name: ml-service-config
+              key: MAIN_API_URL
+        - name: POSTGRES_SERVER
+          valueFrom:
+            configMapKeyRef:
+              name: ml-service-config
+              key: POSTGRES_SERVER
+        - name: POSTGRES_USER
+          valueFrom:
+            configMapKeyRef:
+              name: ml-service-config
+              key: POSTGRES_USER
+        - name: POSTGRES_DB
+          valueFrom:
+            configMapKeyRef:
+              name: ml-service-config
+              key: POSTGRES_DB
+        - name: POSTGRES_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: ml-service-config
+              key: POSTGRES_PORT
+        - name: MODEL_PATH
+          valueFrom:
+            configMapKeyRef:
+              name: ml-service-config
+              key: MODEL_PATH
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: ml-service-secret
+              key: POSTGRES_PASSWORD
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 1
+            memory: 2Gi
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8001
+          initialDelaySeconds: 60
+          timeoutSeconds: 10
+          periodSeconds: 30
+          successThreshold: 1
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8001
+          initialDelaySeconds: 30
+          timeoutSeconds: 5
+          periodSeconds: 10
+          successThreshold: 1
+          failureThreshold: 3
+        volumeMounts:
+        - name: ml-models
+          mountPath: /app/models
+        - name: ml-data
+          mountPath: /app/data
+      volumes:
+      - name: ml-models
+        persistentVolumeClaim:
+          claimName: ml-models-pvc
+      - name: ml-data
+        emptyDir: {}
+      imagePullSecrets:
+      - name: regcred
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ml-service-service
+  namespace: ghibli-food
+  labels:
+    app: ml-service
+    tier: ml
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8001
+    targetPort: 8001
+    protocol: TCP
+    name: http
+  selector:
+    app: ml-service
+    tier: ml
